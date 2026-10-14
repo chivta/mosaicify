@@ -15,6 +15,7 @@
 #include <unordered_map>
 #include <random>
 #include <ctime>
+#include <getopt.h>
 
 #define COMP 3
 
@@ -356,7 +357,8 @@ class ImageCatalog{
     int blocks_per_axis_ {16}; 
     std::vector<std::vector<FileColor>> color_matrix_;
     int index_cap_{0};
-    int max_checks_{3}; // max amount of images checked in a block to find best
+    int max_checks_{}; // max amount of images checked in a block to find best
+    double filter_strength_{};
 
     void write_to_appropriate_block(FileColor fc){
         auto& block = get_appropriate_block(fc.avgColor);
@@ -369,10 +371,11 @@ class ImageCatalog{
     public:
     int images_ctr_{0};
 
-    ImageCatalog(int block_size)
-        : block_size_(block_size), blocks_per_axis_(256/block_size), 
+    ImageCatalog(int block_size, int max_checks, double filter_strength)
+        : block_size_(block_size), blocks_per_axis_(256/block_size),
         color_matrix_(blocks_per_axis_*blocks_per_axis_*blocks_per_axis_),
-        index_cap_(blocks_per_axis_*blocks_per_axis_*blocks_per_axis_) {}
+        index_cap_(blocks_per_axis_*blocks_per_axis_*blocks_per_axis_),
+        max_checks_(max_checks), filter_strength_(filter_strength) {}
 
     void save_cache(std::filesystem::path path){
         if(color_matrix_.size()>0){
@@ -514,7 +517,7 @@ class ImageCatalog{
         assert(most_fitting_image != nullptr);
 
         Image res {most_fitting_image->path};
-        res.set_color_filter({target_pixel,0.5});
+        res.set_color_filter({target_pixel,filter_strength_});
         return res;
     }
 
@@ -555,7 +558,7 @@ class ImageCatalog{
 class ImageGrid{
     int tile_width_ {0};
     int tile_height_ {0};
-    int rounding_coef_{4};
+    int rounding_coef_{};
     bool allow_rotation_{true};
     Canvas canvas;
     ImageCatalog image_catalog_;
@@ -598,8 +601,8 @@ class ImageGrid{
 
     public:
 
-        ImageGrid(int width, int height, int tile_width, int tile_height, ImageCatalog image_catalog)
-        : canvas(width, height), tile_width_(tile_width), tile_height_(tile_height), image_catalog_(image_catalog) {}
+        ImageGrid(int width, int height, int tile_width, int tile_height, int rounding_coef, ImageCatalog image_catalog)
+        : canvas(width, height), tile_width_(tile_width), tile_height_(tile_height), rounding_coef_(rounding_coef), image_catalog_(image_catalog) {}
         
         bool getAllowRotation() const { return allow_rotation_; }
         void setAllowRotation(bool val){ allow_rotation_ = val; }
@@ -658,7 +661,9 @@ class ImageGrid{
                 Image img = image_catalog_.get_closest_image(t.first);
                 img.resize(tile_width_,tile_height_);
                 for(auto& pos : t.second){
-                    img.rotate_90_degrees(rand_n() % 4);
+                    if(allow_rotation_){
+                        img.rotate_90_degrees(rand_n() % 4);
+                    }
                     place_tile(pos.first,pos.second,img);
                 }
             }
@@ -722,29 +727,175 @@ class ImageGrid{
 };
 
 
-int main(){
+constexpr const char* PROGRAM_NAME = "mosaicify";
+constexpr int COLOR_CHANNEL_VALUES = 256;
 
-    Image img {"/home/arvlas/Projects/Mosaicify/hitler.png"};
+constexpr int DEFAULT_BLOCK_SIZE = 32;
+constexpr int DEFAULT_TILE_SIZE = 64;
+constexpr int DEFAULT_SCALE = 10;
+constexpr int DEFAULT_MAX_CHECKS = 3;
+constexpr double DEFAULT_FILTER_STRENGTH = 0.5;
+constexpr int DEFAULT_ROUNDING_COEF = 4;
+
+struct Options{
+    std::filesystem::path input;
+    std::filesystem::path output;
+    std::filesystem::path images_dir;
+    std::filesystem::path cache;
+    int block_size {DEFAULT_BLOCK_SIZE};
+    int tile_width {DEFAULT_TILE_SIZE};
+    int tile_height {DEFAULT_TILE_SIZE};
+    int scale {DEFAULT_SCALE};
+    int max_checks {DEFAULT_MAX_CHECKS};
+    double filter_strength {DEFAULT_FILTER_STRENGTH};
+    int rounding_coef {DEFAULT_ROUNDING_COEF};
+    bool allow_rotation {true};
+};
+
+void print_usage(std::ostream& os){
+    os << "Usage: " << PROGRAM_NAME << " -i <target> -o <output> (-d <dir> | -c <cache>) [options]\n"
+       << "\n"
+       << "  -i, --input <path>         target image to turn into a mosaic\n"
+       << "  -o, --output <path>        where to write the mosaic, .png or .jpg\n"
+       << "  -d, --images <dir>         scan this directory for tile images\n"
+       << "  -c, --cache <path>         tile catalog cache, written after a scan with -d,\n"
+       << "                             loaded instead of scanning without -d\n"
+       << "  -s, --scale <n>            multiply target size by n before tiling (default " << DEFAULT_SCALE << ")\n"
+       << "      --tile-width <px>      tile width (default " << DEFAULT_TILE_SIZE << ")\n"
+       << "      --tile-height <px>     tile height (default " << DEFAULT_TILE_SIZE << ")\n"
+       << "      --block-size <n>       catalog color bucket size, power of two up to " << COLOR_CHANNEL_VALUES
+                                          << " (default " << DEFAULT_BLOCK_SIZE << ")\n"
+       << "      --max-checks <n>       catalog images sampled per tile color (default " << DEFAULT_MAX_CHECKS << ")\n"
+       << "      --filter-strength <f>  tint tiles toward the target color, 0 to 1 (default " << DEFAULT_FILTER_STRENGTH << ")\n"
+       << "      --rounding <n>         tiles whose colors round to the same multiple of n\n"
+       << "                             share one catalog image (default " << DEFAULT_ROUNDING_COEF << ")\n"
+       << "      --no-rotation          don't rotate tiles randomly\n"
+       << "  -h, --help                 show this help\n";
+}
+
+[[noreturn]] void exit_with_help_hint(){
+    std::cerr << "Try '" << PROGRAM_NAME << " --help' for more information.\n";
+    std::exit(EXIT_FAILURE);
+}
+
+[[noreturn]] void usage_error(const std::string& message){
+    std::cerr << PROGRAM_NAME << ": " << message << '\n';
+    exit_with_help_hint();
+}
+
+int parse_positive_int(const char* flag, const char* value){
+    try{
+        size_t parsed = 0;
+        int res = std::stoi(value, &parsed);
+        if(value[parsed] == '\0' && res >= 1){ return res; }
+    }
+    catch (const std::exception&){}
+    usage_error(std::string(flag) + " expects a positive integer, got '" + value + "'");
+}
+
+double parse_double(const char* flag, const char* value){
+    try{
+        size_t parsed = 0;
+        double res = std::stod(value, &parsed);
+        if(value[parsed] == '\0'){ return res; }
+    }
+    catch (const std::exception&){}
+    usage_error(std::string(flag) + " expects a number, got '" + value + "'");
+}
+
+Options parse_options(int argc, char* argv[]){
+    enum LongOnlyOption { TILE_WIDTH = 256, TILE_HEIGHT, BLOCK_SIZE, MAX_CHECKS, FILTER_STRENGTH, ROUNDING, NO_ROTATION };
+    const option long_options[] = {
+        {"input",           required_argument, nullptr, 'i'},
+        {"output",          required_argument, nullptr, 'o'},
+        {"images",          required_argument, nullptr, 'd'},
+        {"cache",           required_argument, nullptr, 'c'},
+        {"scale",           required_argument, nullptr, 's'},
+        {"tile-width",      required_argument, nullptr, TILE_WIDTH},
+        {"tile-height",     required_argument, nullptr, TILE_HEIGHT},
+        {"block-size",      required_argument, nullptr, BLOCK_SIZE},
+        {"max-checks",      required_argument, nullptr, MAX_CHECKS},
+        {"filter-strength", required_argument, nullptr, FILTER_STRENGTH},
+        {"rounding",        required_argument, nullptr, ROUNDING},
+        {"no-rotation",     no_argument,       nullptr, NO_ROTATION},
+        {"help",            no_argument,       nullptr, 'h'},
+        {nullptr, 0, nullptr, 0},
+    };
+
+    Options opts {};
+    int opt;
+    while((opt = getopt_long(argc, argv, "i:o:d:c:s:h", long_options, nullptr)) != -1){
+        switch(opt){
+            case 'i': opts.input = optarg; break;
+            case 'o': opts.output = optarg; break;
+            case 'd': opts.images_dir = optarg; break;
+            case 'c': opts.cache = optarg; break;
+            case 's': opts.scale = parse_positive_int("--scale", optarg); break;
+            case TILE_WIDTH: opts.tile_width = parse_positive_int("--tile-width", optarg); break;
+            case TILE_HEIGHT: opts.tile_height = parse_positive_int("--tile-height", optarg); break;
+            case BLOCK_SIZE:
+                opts.block_size = parse_positive_int("--block-size", optarg);
+                // ImageCatalog splits each channel into 256/block_size buckets, any other size leaves the top values without a bucket
+                if(opts.block_size > COLOR_CHANNEL_VALUES || (opts.block_size & (opts.block_size - 1)) != 0){
+                    usage_error("--block-size must be a power of two up to " + std::to_string(COLOR_CHANNEL_VALUES));
+                }
+                break;
+            case MAX_CHECKS: opts.max_checks = parse_positive_int("--max-checks", optarg); break;
+            case FILTER_STRENGTH:
+                opts.filter_strength = parse_double("--filter-strength", optarg);
+                if(opts.filter_strength < 0 || opts.filter_strength > 1){
+                    usage_error("--filter-strength must be between 0 and 1");
+                }
+                break;
+            case ROUNDING: opts.rounding_coef = parse_positive_int("--rounding", optarg); break;
+            case NO_ROTATION: opts.allow_rotation = false; break;
+            case 'h': print_usage(std::cout); std::exit(EXIT_SUCCESS);
+            // getopt_long has already printed what was wrong
+            default: exit_with_help_hint();
+        }
+    }
+
+    if(optind < argc){ usage_error(std::string("unexpected argument '") + argv[optind] + "'"); }
+    if(opts.input.empty()){ usage_error("--input is required"); }
+    if(opts.output.empty()){ usage_error("--output is required"); }
+    // checked up front so a typo doesn't surface only after the whole mosaic is built
+    std::string output_ext = opts.output.extension().string();
+    if(output_ext != ".png" && output_ext != ".jpg"){ usage_error("--output must end with .png or .jpg"); }
+    if(opts.images_dir.empty() && opts.cache.empty()){ usage_error("--images or --cache is required"); }
+
+    return opts;
+}
+
+int main(int argc, char* argv[]){
+    Options opts = parse_options(argc, argv);
+
+    Image img {opts.input};
     std::cout << "initialized image" << '\n';
 
     std::cout << "initializing catalog\n";
-    ImageCatalog catalog(32);
+    ImageCatalog catalog(opts.block_size, opts.max_checks, opts.filter_strength);
 
-    std::cout<< "loading cache\n";
-    catalog.load_cache("/home/arvlas/Projects/Mosaicify/cache");
+    if(!opts.images_dir.empty()){
+        std::cout << "scanning dir" << '\n';
+        catalog.ScanDir(opts.images_dir);
 
-    // std::cout << "scanning dir" << '\n';
-    // catalog.ScanDir("/home/arvlas/Projects/Mosaicify/images/");
-
-    // std::cout<< "saving cache\n";
-    // catalog.save_cache("/home/arvlas/Projects/Mosaicify/cache");
-
-    std::cout << "initializing imGrid\n";
-    ImageGrid imGrid(256,256,64,64,catalog);
+        if(!opts.cache.empty()){
+            std::cout<< "saving cache\n";
+            catalog.save_cache(opts.cache);
+        }
+    }
+    else{
+        std::cout<< "loading cache\n";
+        catalog.load_cache(opts.cache);
+    }
 
     std::cout << "resizing image" << '\n';
-    img.resize(img.getWidth()*10,img.getHeight()*10);
-    
+    img.resize(img.getWidth()*opts.scale,img.getHeight()*opts.scale);
+
+    std::cout << "initializing imGrid\n";
+    ImageGrid imGrid(img.getWidth(),img.getHeight(),opts.tile_width,opts.tile_height,opts.rounding_coef,catalog);
+    imGrid.setAllowRotation(opts.allow_rotation);
+
     std::cout << "setting target image" << '\n';
     imGrid.set_target_image(img);
 
@@ -752,7 +903,7 @@ int main(){
     imGrid.apply_mosaic();
 
     std::cout << "saving" << '\n';
-    imGrid.save("/home/arvlas/Projects/Mosaicify/OUT.png");
+    imGrid.save(opts.output);
 
     return 0;
 }
