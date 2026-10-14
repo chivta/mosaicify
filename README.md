@@ -1,11 +1,12 @@
 # Mosaicify
 A tool that generates a mosaic image by replacing each region of a source image with the closest-matching image from a catalog based on average color.
 
-| Target | Mosaic |
-|---|---|
-| ![Target cat photo](cat.jpg) | ![Mosaic of the cat built from cat photos](out.jpg) |
+<p>
+  <img src="cat.jpg" alt="Target cat photo" width="49%">
+  <img src="out.jpg" alt="Mosaic of the cat built from cat photos" width="49%">
+</p>
 
-The mosaic is built from the 12,500 cat photos in Microsoft's [Kaggle Cats and Dogs Dataset](https://www.microsoft.com/en-us/download/details.aspx?id=54765). Open `out.jpg` at full size (6400×6400) to see the individual photos.
+The target photo is on the left. The mosaic on the right is built from the 12,500 cat photos in Microsoft's [Kaggle Cats and Dogs Dataset](https://www.microsoft.com/en-us/download/details.aspx?id=54765). Open `out.jpg` at full size (6400×6400) to see the individual photos.
 
 ## Run locally
 
